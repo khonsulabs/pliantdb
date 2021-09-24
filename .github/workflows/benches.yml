@@ -1,0 +1,28 @@
+name: Benchmarks
+
+on: [push]
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Run benchmarks
+        run: |
+          cargo bench
+        env:
+          DBS: roots,sqlite
+
+      - name: Deploy Docs
+        # TODO remove roots after merge
+        if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/roots' }}
+        uses: JamesIves/github-pages-deploy-action@releases/v4
+        with:
+          branch: gh-pages
+          folder: target/criterion/
+          git-config-name: kl-botsu
+          git-config-email: botsu@khonsulabs.com
+          target-folder: /benchmarks/
+          clean: true

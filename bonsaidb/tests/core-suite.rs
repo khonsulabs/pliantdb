@@ -225,7 +225,7 @@ async fn assume_permissions(
                 .unwrap();
         }
         Err(bonsaidb_core::Error::UniqueKeyViolation { .. }) => {}
-        Err(other) => anyhow::bail!(dbg!(other)),
+        Err(other) => anyhow::bail!(other),
     };
 
     connection

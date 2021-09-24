@@ -146,7 +146,7 @@ impl Command {
         let document_writer = tokio::spawn(write_documents(receiver, backup_directory));
         tokio::task::spawn_blocking::<_, anyhow::Result<()>>(move || {
             for (database, collection_tree) in
-                db.sled().tree_names().into_iter().filter_map(|tree| {
+                db.roots().tree_names().into_iter().filter_map(|tree| {
                     // Extract the database_endbase name, but also check that it's a collection
 
                     if let Some(database_end) = tree.windows(2).position(|t| t.starts_with(b"::")) {
@@ -168,7 +168,7 @@ impl Command {
                     CollectionName::try_from(collection_name.split("::").last().unwrap())?;
 
                 let database = Arc::new(database);
-                let tree = db.sled().open_tree(&collection_tree)?;
+                let tree = db.roots().tree(&collection_tree);
                 for result in tree.iter() {
                     let (_, document) = result?;
                     let document = bincode::deserialize::<Document<'_>>(&document)?;
@@ -180,7 +180,7 @@ impl Command {
                 }
 
                 if let Ok(tree) = db
-                    .sled()
+                    .roots()
                     .open_tree(transaction_tree_name(&database).as_bytes())
                 {
                     for row in tree.iter() {
@@ -356,10 +356,10 @@ fn restore_documents(receiver: Receiver<BackupEntry>, storage: Storage) -> anyho
                 document,
             } => {
                 let tree = storage
-                    .sled()
-                    .open_tree(document_tree_name(&database, &collection))?;
-                tree.insert(
-                    document.header.id.as_big_endian_bytes()?,
+                    .roots()
+                    .tree(document_tree_name(&database, &collection));
+                tree.set(
+                    document.header.id.as_big_endian_bytes()?.as_ref(),
                     bincode::serialize(&document)?,
                 )?;
             }
@@ -367,16 +367,14 @@ fn restore_documents(receiver: Receiver<BackupEntry>, storage: Storage) -> anyho
                 database,
                 transaction,
             } => {
-                let tree = storage.sled().open_tree(transaction_tree_name(&database))?;
-                tree.insert(
-                    transaction.id.as_big_endian_bytes()?,
+                let tree = storage.roots().tree(transaction_tree_name(&database));
+                tree.set(
+                    transaction.id.as_big_endian_bytes()?.as_ref(),
                     bincode::serialize(&transaction)?,
                 )?;
             }
         }
     }
-
-    storage.sled().flush()?;
 
     Ok(())
 }

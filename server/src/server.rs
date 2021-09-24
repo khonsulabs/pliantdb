@@ -621,25 +621,6 @@ impl<B: Backend> CustomServer<B> {
 
         while let Some(payload) = receiver.next().await {
             drop(request_sender.send_async(payload?).await);
-            // let Payload { id, wrapped } = ;
-            // let task_sender = payload_sender.clone();
-            // self.handle_request_through_worker(
-            //     wrapped,
-            //     move |response| async move {
-            //         drop(task_sender.send(Payload {
-            //             id,
-            //             wrapped: response,
-            //         }));
-
-            //         Ok(())
-            //     },
-            //     client.clone(),
-            //     #[cfg(feature = "pubsub")]
-            //     self.data.subscribers.clone(),
-            //     #[cfg(feature = "pubsub")]
-            //     payload_sender.clone(),
-            // )
-            // .await?;
         }
 
         Ok(())

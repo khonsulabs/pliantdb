@@ -15,11 +15,8 @@ use bonsaidb_core::{
     },
 };
 use bonsaidb_jobs::{Job, Keyed};
+use bonsaidb_roots::{Buffer, ExecutingTransaction, StdFile, Tree};
 use serde::{Deserialize, Serialize};
-use sled::{
-    transaction::{ConflictableTransactionError, TransactionError, TransactionalTree},
-    IVec, Transactional, Tree,
-};
 
 use crate::{
     database::{document_tree_name, Database},
@@ -53,42 +50,37 @@ where
 
     #[allow(clippy::too_many_lines)]
     async fn execute(&mut self) -> anyhow::Result<Self::Output> {
-        let documents = self
-            .storage
-            .data
-            .storage
-            .sled()
-            .open_tree(document_tree_name(
-                &self.storage.data.name,
-                &self.map.collection,
-            ))?;
+        let documents = self.storage.data.storage.roots().tree(document_tree_name(
+            &self.storage.data.name,
+            &self.map.collection,
+        ))?;
 
         let view_entries = self
             .storage
             .data
             .storage
-            .sled()
-            .open_tree(view_entries_tree_name(
+            .roots()
+            .tree(view_entries_tree_name(
                 &self.storage.data.name,
                 &self.map.view_name,
             ))?;
 
-        let document_map =
-            self.storage
-                .data
-                .storage
-                .sled()
-                .open_tree(view_document_map_tree_name(
-                    &self.storage.data.name,
-                    &self.map.view_name,
-                ))?;
+        let document_map = self
+            .storage
+            .data
+            .storage
+            .roots()
+            .tree(view_document_map_tree_name(
+                &self.storage.data.name,
+                &self.map.view_name,
+            ))?;
 
         let invalidated_entries =
             self.storage
                 .data
                 .storage
-                .sled()
-                .open_tree(view_invalidated_docs_tree_name(
+                .roots()
+                .tree(view_invalidated_docs_tree_name(
                     &self.storage.data.name,
                     &self.map.view_name,
                 ))?;
@@ -97,8 +89,8 @@ where
             self.storage
                 .data
                 .storage
-                .sled()
-                .open_tree(view_omitted_docs_tree_name(
+                .roots()
+                .tree(view_omitted_docs_tree_name(
                     &self.storage.data.name,
                     &self.map.view_name,
                 ))?;
@@ -141,90 +133,81 @@ where
 }
 
 fn map_view<DB: Schema>(
-    invalidated_entries: &Tree,
-    document_map: &Tree,
-    documents: &Tree,
-    omitted_entries: &Tree,
-    view_entries: &Tree,
+    invalidated_entries: &Tree<StdFile>,
+    document_map: &Tree<StdFile>,
+    documents: &Tree<StdFile>,
+    omitted_entries: &Tree<StdFile>,
+    view_entries: &Tree<StdFile>,
     storage: &Database<DB>,
     map_request: &Map,
 ) -> anyhow::Result<()> {
     // Only do any work if there are invalidated documents to process
     let invalidated_ids = invalidated_entries
-        .iter()
-        .collect::<Result<Vec<_>, _>>()?
+        .get_range(..)?
         .into_iter()
         .map(|(key, _)| key)
         .collect::<Vec<_>>();
     if !invalidated_ids.is_empty() {
-        (
-            invalidated_entries,
-            document_map,
-            documents,
-            omitted_entries,
-            view_entries,
-        )
-            .transaction(
-                |(invalidated_entries, document_map, documents, omitted_entries, view_entries)| {
-                    let view = storage
-                        .data
-                        .schema
-                        .view_by_name(&map_request.view_name)
-                        .unwrap();
-                    for document_id in &invalidated_ids {
-                        DocumentRequest {
-                            document_id,
-                            map_request,
-                            database: storage,
-                            document_map,
-                            documents,
-                            omitted_entries,
-                            view_entries,
-                            view,
-                        }
-                        .map()?;
-                        invalidated_entries.remove(document_id)?;
-                    }
-                    Ok(())
-                },
-            )
-            .map_err(|err| match err {
-                TransactionError::Abort(err) => err,
-                TransactionError::Storage(err) => bonsaidb_core::Error::Database(err.to_string()),
-            })?;
+        let mut transaction = storage.storage().roots().transaction(&[
+            invalidated_entries.name(),
+            document_map.name(),
+            documents.name(),
+            omitted_entries.name(),
+            view_entries.name(),
+        ])?;
+        let view = storage
+            .data
+            .schema
+            .view_by_name(&map_request.view_name)
+            .unwrap();
+        for document_id in &invalidated_ids {
+            DocumentRequest {
+                document_id,
+                map_request,
+                database: storage,
+                transaction: &mut transaction,
+                document_map_index: 1,
+                documents_index: 2,
+                omitted_entries_index: 3,
+                view_entries_index: 4,
+                view,
+            }
+            .map()?;
+            let invalidated_entries = transaction.tree(0).unwrap();
+            invalidated_entries.remove(document_id)?;
+        }
+        transaction.commit()?;
     }
 
     Ok(())
 }
 
 pub struct DocumentRequest<'a, DB> {
-    pub document_id: &'a IVec,
+    pub document_id: &'a [u8],
     pub map_request: &'a Map,
     pub database: &'a Database<DB>,
 
-    pub document_map: &'a TransactionalTree,
-    pub documents: &'a TransactionalTree,
-    pub omitted_entries: &'a TransactionalTree,
-    pub view_entries: &'a TransactionalTree,
+    pub transaction: &'a mut ExecutingTransaction<StdFile>,
+    pub document_map_index: usize,
+    pub documents_index: usize,
+    pub omitted_entries_index: usize,
+    pub view_entries_index: usize,
     pub view: &'a dyn Serialized,
 }
 
 impl<'a, DB: Schema> DocumentRequest<'a, DB> {
-    pub fn map(&self) -> Result<(), ConflictableTransactionError<bonsaidb_core::Error>> {
+    pub fn map(&mut self) -> Result<(), Error> {
+        let documents = self.transaction.tree(self.documents_index).unwrap();
         let (doc_still_exists, map_result) =
-            if let Some(document) = self.documents.get(self.document_id)? {
-                let document = self
-                    .database
-                    .deserialize_document(&document)
-                    .map_to_transaction_error()?;
+            if let Some(document) = documents.get(self.document_id)? {
+                let document = self.database.deserialize_document(&document)?;
 
                 // Call the schema map function
                 (
                     true,
                     self.view
                         .map(&document)
-                        .map_err(bonsaidb_core::Error::from)
-                        .map_to_transaction_error()?,
+                        .map_err(bonsaidb_core::Error::from)?,
                 )
             } else {
                 (false, None)
@@ -239,18 +222,16 @@ impl<'a, DB: Schema> DocumentRequest<'a, DB> {
         Ok(())
     }
 
-    fn omit_document(
-        &self,
-        doc_still_exists: bool,
-    ) -> Result<(), ConflictableTransactionError<bonsaidb_core::Error>> {
+    fn omit_document(&mut self, doc_still_exists: bool) -> Result<(), Error> {
         // When no entry is emitted, the document map is emptied and a note is made in omitted_entries
-        if let Some(existing_map) = self.document_map.remove(self.document_id)? {
+        let document_map = self.transaction.tree(self.document_map_index).unwrap();
+        if let Some(existing_map) = document_map.remove(self.document_id)? {
             self.remove_existing_view_entries_for_keys(&[], &existing_map)?;
         }
 
         if doc_still_exists {
-            self.omitted_entries
-                .insert(self.document_id, IVec::default())?;
+            let omitted_entries = self.transaction.tree(self.omitted_entries_index).unwrap();
+            omitted_entries.set(self.document_id.to_vec(), b"")?;
         }
         Ok(())
     }
@@ -279,11 +260,7 @@ impl<'a, DB: Schema> DocumentRequest<'a, DB> {
         Ok(bytes)
     }
 
-    fn load_entry_for_key(
-        &self,
-        key: &[u8],
-    ) -> Result<Option<ViewEntryCollection>, ConflictableTransactionError<bonsaidb_core::Error>>
-    {
+    fn load_entry_for_key(&mut self, key: &[u8]) -> Result<Option<ViewEntryCollection>, Error> {
         load_entry_for_key(
             key,
             self.view,
@@ -291,51 +268,43 @@ impl<'a, DB: Schema> DocumentRequest<'a, DB> {
             self.database.storage().vault(),
             self.database.data.effective_permissions.as_ref(),
             |key| {
-                self.view_entries
+                self.transaction
+                    .tree(self.view_entries_index)
+                    .unwrap()
                     .get(key)
-                    .map_err(ConflictableTransactionError::from)
+                    .map_err(Error::from)
             },
         )
     }
 
-    fn save_entry_for_key(
-        &self,
-        key: &[u8],
-        entry: &ViewEntryCollection,
-    ) -> Result<(), ConflictableTransactionError<bonsaidb_core::Error>> {
-        let bytes = self
-            .serialize_and_encrypt(entry)
-            .map_to_transaction_error()?;
-        if self.view.keys_are_encryptable() && self.encryption_key().is_some() {
+    fn save_entry_for_key(&mut self, key: &[u8], entry: &ViewEntryCollection) -> Result<(), Error> {
+        let bytes = self.serialize_and_encrypt(entry)?;
+        let should_hash_key = self.view.keys_are_encryptable() && self.encryption_key().is_some();
+        let view_entries = self.transaction.tree(self.view_entries_index).unwrap();
+        if should_hash_key {
             let hashed_key = hash_key(key);
-            self.view_entries.insert(&hashed_key, bytes)?;
+            view_entries.set(hashed_key, bytes)?;
         } else {
-            self.view_entries.insert(key, bytes)?;
+            view_entries.set(key.to_vec(), bytes)?;
         }
         Ok(())
     }
 
-    fn save_mapping(
-        &self,
-        source: u64,
-        key: &[u8],
-        value: Vec<u8>,
-    ) -> Result<(), ConflictableTransactionError<bonsaidb_core::Error>> {
+    fn save_mapping(&mut self, source: u64, key: &[u8], value: Vec<u8>) -> Result<(), Error> {
         // Before altering any data, verify that the key is unique if this is a unique view.
         if self.view.unique() {
             if let Some(existing_entry) = self.load_entry_for_key(key)? {
                 if existing_entry.mappings[0].source != source {
-                    return Err(bonsaidb_core::Error::UniqueKeyViolation {
+                    return Err(Error::Core(bonsaidb_core::Error::UniqueKeyViolation {
                         view: self.map_request.view_name.clone(),
                         conflicting_document_id: source,
                         existing_document_id: existing_entry.mappings[0].source,
-                    })
-                    .map_to_transaction_error();
+                    }));
                 }
             }
         }
-
-        self.omitted_entries.remove(self.document_id)?;
+        let omitted_entries = self.transaction.tree(self.omitted_entries_index).unwrap();
+        omitted_entries.remove(self.document_id)?;
 
         // When map results are returned, the document
         // map will contain an array of keys that the
@@ -343,11 +312,11 @@ impl<'a, DB: Schema> DocumentRequest<'a, DB> {
         // single emits, so it's going to be a
         // single-entry vec for now.
         let keys: Vec<Cow<'_, [u8]>> = vec![Cow::Borrowed(key)];
-        if let Some(existing_map) = self.document_map.insert(
-            self.document_id,
-            self.serialize_and_encrypt(&keys)
-                .map_to_transaction_error()?,
-        )? {
+        let encrypted_entry = self.serialize_and_encrypt(&keys)?;
+        let document_map = self.transaction.tree(self.document_map_index).unwrap();
+        if let Some(existing_map) =
+            document_map.replace(self.document_id.to_vec(), encrypted_entry)?
+        {
             self.remove_existing_view_entries_for_keys(&keys, &existing_map)?;
         }
 
@@ -393,16 +362,14 @@ impl<'a, DB: Schema> DocumentRequest<'a, DB> {
             entry.reduced_value = self
                 .view
                 .reduce(&mappings, false)
-                .map_err(bonsaidb_core::Error::from)
-                .map_to_transaction_error()?;
+                .map_err(bonsaidb_core::Error::from)?;
 
             entry
         } else {
             let reduced_value = self
                 .view
                 .reduce(&[(key, &entry_mapping.value)], false)
-                .map_err(bonsaidb_core::Error::from)
-                .map_to_transaction_error()?;
+                .map_err(bonsaidb_core::Error::from)?;
             ViewEntryCollection::from(ViewEntry {
                 key: key.to_vec(),
                 view_version: self.view.version(),
@@ -415,10 +382,10 @@ impl<'a, DB: Schema> DocumentRequest<'a, DB> {
     }
 
     fn remove_existing_view_entries_for_keys(
-        &self,
+        &mut self,
         keys: &[Cow<'_, [u8]>],
         existing_map: &[u8],
-    ) -> Result<(), ConflictableTransactionError<bonsaidb_core::Error>> {
+    ) -> Result<(), Error> {
         let existing_keys = self
             .database
             .storage()
@@ -427,8 +394,7 @@ impl<'a, DB: Schema> DocumentRequest<'a, DB> {
                 self.database.data.effective_permissions.as_ref(),
                 existing_map,
             )
-            .map_err(bonsaidb_core::Error::from)
-            .map_to_transaction_error()?;
+            .map_err(bonsaidb_core::Error::from)?;
         if existing_keys == keys {
             // No change
             return Ok(());
@@ -450,7 +416,8 @@ impl<'a, DB: Schema> DocumentRequest<'a, DB> {
                 entry_collection.remove_active_entry();
                 if entry_collection.is_empty() {
                     // Remove the key
-                    self.view_entries.remove(
+                    let view_entries = self.transaction.tree(self.view_entries_index).unwrap();
+                    view_entries.remove(
                         entry_collection
                             .loaded_from
                             .as_ref()
@@ -467,17 +434,16 @@ impl<'a, DB: Schema> DocumentRequest<'a, DB> {
                 entry_collection.reduced_value = self
                     .view
                     .reduce(&mappings, false)
-                    .map_err(bonsaidb_core::Error::from)
-                    .map_to_transaction_error()?;
+                    .map_err(bonsaidb_core::Error::from)?;
             }
 
-            self.view_entries.insert(
+            let value = self.serialize_and_encrypt(&entry_collection)?;
+            let view_entries = self.transaction.tree(self.view_entries_index).unwrap();
+            view_entries.set(
                 entry_collection
                     .loaded_from
-                    .as_ref()
-                    .map_or(existing_keys[0].as_ref(), |key| &key[..]),
-                self.serialize_and_encrypt(&entry_collection)
-                    .map_to_transaction_error()?,
+                    .map_or(existing_keys[0].to_vec(), |key| key.to_vec()),
+                value,
             )?;
         }
 
@@ -494,17 +460,7 @@ where
     }
 }
 
-trait ToTransactionResult<T, E> {
-    fn map_to_transaction_error<RE: From<E>>(self) -> Result<T, ConflictableTransactionError<RE>>;
-}
-
-impl<T, E> ToTransactionResult<T, E> for Result<T, E> {
-    fn map_to_transaction_error<RE: From<E>>(self) -> Result<T, ConflictableTransactionError<RE>> {
-        self.map_err(|err| ConflictableTransactionError::Abort(RE::from(err)))
-    }
-}
-
-fn hash_key(key: &[u8]) -> [u8; 32] {
+pub fn hash_key(key: &[u8]) -> [u8; 32] {
     let res = blake3::hash(key);
     *res.as_bytes()
 }
@@ -562,16 +518,14 @@ impl ViewEntryCollection {
     }
 }
 
-pub(crate) fn load_entry_for_key<
-    F: FnOnce(&[u8]) -> Result<Option<IVec>, ConflictableTransactionError<bonsaidb_core::Error>>,
->(
+pub(crate) fn load_entry_for_key<F: FnOnce(&[u8]) -> Result<Option<Buffer<'static>>, Error>>(
     key: &[u8],
     view: &dyn Serialized,
     encrypt_by_default: bool,
     vault: &Vault,
     permissions: Option<&Permissions>,
     get_entry_fn: F,
-) -> Result<Option<ViewEntryCollection>, ConflictableTransactionError<bonsaidb_core::Error>> {
+) -> Result<Option<ViewEntryCollection>, Error> {
     if view.keys_are_encryptable() && encrypt_by_default {
         // When we encrypt the keys, we need to be able to find them
         // reliably. We're using a hashing function to create buckets where
@@ -581,8 +535,7 @@ pub(crate) fn load_entry_for_key<
         // entry before returning.
         let key_hash = hash_key(key);
         if let Some(bytes) = get_entry_fn(&key_hash)? {
-            let mut collection =
-                deserialize_entry(vault, permissions, &bytes).map_to_transaction_error()?;
+            let mut collection = deserialize_entry(vault, permissions, &bytes)?;
             collection.loaded_from = Some(key_hash);
             for (index, entry) in collection.entries.iter().enumerate() {
                 if entry.key == key {
@@ -599,8 +552,7 @@ pub(crate) fn load_entry_for_key<
         // Without encryption, the keys are guaranteed to be unique.
         Ok(get_entry_fn(key)?
             .map(|bytes| deserialize_entry(vault, permissions, &bytes))
-            .transpose()
-            .map_to_transaction_error()?)
+            .transpose()?)
     }
 }
 

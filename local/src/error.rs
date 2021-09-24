@@ -1,15 +1,16 @@
-use std::sync::Arc;
+use std::{convert::Infallible, sync::Arc};
 
 use bonsaidb_core::schema::{view, InvalidNameError};
+use bonsaidb_roots::AbortError;
 
 use crate::vault;
 
 /// Errors that can occur from interacting with storage.
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
-    /// An error occurred interacting with `sled`.
+    /// An error occurred interacting with the storage layer, `bonsaidb_roots`.
     #[error("error from storage: {0}")]
-    Sled(#[from] sled::Error),
+    Roots(#[from] bonsaidb_roots::Error),
 
     /// An error occurred serializing the underlying database structures.
     #[error("error while serializing internal structures: {0}")]
@@ -52,6 +53,15 @@ impl From<Error> for bonsaidb_core::Error {
 impl From<InvalidNameError> for Error {
     fn from(err: InvalidNameError) -> Self {
         Self::Core(bonsaidb_core::Error::from(err))
+    }
+}
+
+impl From<AbortError<Infallible>> for Error {
+    fn from(err: AbortError<Infallible>) -> Self {
+        match err {
+            AbortError::Roots(error) => Self::Roots(error),
+            AbortError::Other(_) => unreachable!(),
+        }
     }
 }
 

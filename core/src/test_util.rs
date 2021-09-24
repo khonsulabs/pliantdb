@@ -692,6 +692,7 @@ pub async fn bad_update_tests<C: Connection>(db: &C) -> anyhow::Result<()> {
 }
 
 pub async fn no_update_tests<C: Connection>(db: &C) -> anyhow::Result<()> {
+    println!("Here");
     let original_value = Basic::new("initial_value");
     let collection = db.collection::<Basic>();
     let header = collection.push(&original_value).await?;
@@ -1091,6 +1092,7 @@ pub async fn user_management_tests<C: Connection, S: ServerConnection>(
         .await?;
     server.add_role_to_user(&username, &role).await?;
     {
+        // TODO this is what's failing.
         let user = User::load(&username, admin)
             .await
             .unwrap()

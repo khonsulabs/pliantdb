@@ -6,3 +6,4 @@ Cargo.lock
 *.profraw
 *.profdata
 coverage/
+*.folded

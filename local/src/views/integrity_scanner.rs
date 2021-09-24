@@ -3,7 +3,7 @@ use std::{borrow::Cow, collections::HashSet, hash::Hash, sync::Arc};
 use async_trait::async_trait;
 use bonsaidb_core::schema::{view, CollectionName, Key, Schema, ViewName};
 use bonsaidb_jobs::{Job, Keyed};
-use sled::{IVec, Transactional, Tree};
+use bonsaidb_roots::{tree::KeyEvaluation, StdFile, Tree};
 
 use super::{
     mapper::{Map, Mapper},
@@ -33,37 +33,35 @@ where
     type Output = ();
 
     async fn execute(&mut self) -> anyhow::Result<Self::Output> {
-        let documents = self.database.sled().open_tree(document_tree_name(
+        let documents = self.database.sled().tree(document_tree_name(
             &self.database.data.name,
             &self.scan.collection,
         ))?;
 
-        let view_versions = self.database.sled().open_tree(view_versions_tree_name(
+        let view_versions = self.database.sled().tree(view_versions_tree_name(
             &self.database.data.name,
             &self.scan.collection,
         ))?;
 
-        let document_map = self.database.sled().open_tree(view_document_map_tree_name(
+        let document_map = self.database.sled().tree(view_document_map_tree_name(
             &self.database.data.name,
             &self.scan.view_name,
         ))?;
 
-        let invalidated_entries =
-            self.database
-                .sled()
-                .open_tree(view_invalidated_docs_tree_name(
-                    &self.database.data.name,
-                    &self.scan.view_name,
-                ))?;
+        let invalidated_entries = self.database.sled().tree(view_invalidated_docs_tree_name(
+            &self.database.data.name,
+            &self.scan.view_name,
+        ))?;
 
         let view_name = self.scan.view_name.clone();
         let view_version = self.scan.view_version;
+        let roots = self.database.sled().clone();
 
         let needs_update = tokio::task::spawn_blocking::<_, anyhow::Result<bool>>(move || {
             let document_ids = tree_keys::<u64>(&documents)?;
             let view_is_current_version =
                 if let Some(version) = view_versions.get(view_name.to_string().as_bytes())? {
-                    if let Ok(version) = u64::from_big_endian_bytes(&version) {
+                    if let Ok(version) = u64::from_big_endian_bytes(version.as_slice()) {
                         version == view_version
                     } else {
                         false
@@ -87,26 +85,19 @@ where
             if !missing_entries.is_empty() {
                 // Add all missing entries to the invalidated list. The view
                 // mapping job will update them on the next pass.
-                (&invalidated_entries, &view_versions)
-                    .transaction(|(invalidated_entries, view_versions)| {
-                        view_versions.insert(
-                            view_name.to_string().as_bytes(),
-                            view_version.as_big_endian_bytes().unwrap().as_ref(),
-                        )?;
-                        for id in &missing_entries {
-                            invalidated_entries.insert(
-                                id.as_big_endian_bytes().unwrap().as_ref(),
-                                IVec::default(),
-                            )?;
-                        }
-                        Ok(())
-                    })
-                    .map_err(|err| match err {
-                        sled::transaction::TransactionError::Abort(err) => err,
-                        sled::transaction::TransactionError::Storage(err) => {
-                            anyhow::Error::from(err)
-                        }
-                    })?;
+                let mut transaction =
+                    roots.transaction(&[invalidated_entries.name(), view_versions.name()])?;
+                let view_versions = transaction.tree(1).unwrap();
+                view_versions.set(
+                    // TODO This is wasteful
+                    view_name.to_string().as_bytes().to_vec(),
+                    view_version.as_big_endian_bytes().unwrap().to_vec(),
+                )?;
+                let invalidated_entries = transaction.tree(0).unwrap();
+                for id in &missing_entries {
+                    invalidated_entries.set(id.as_big_endian_bytes().unwrap().to_vec(), b"")?;
+                }
+                transaction.commit()?;
 
                 return Ok(true);
             }
@@ -149,15 +140,22 @@ where
     }
 }
 
-fn tree_keys<K: Key + Hash + Eq + Clone>(tree: &Tree) -> Result<HashSet<K>, anyhow::Error> {
-    let mut ids = HashSet::new();
-    for result in tree.iter() {
-        let (key, _) = result?;
-        let key = K::from_big_endian_bytes(&key).map_err(view::Error::KeySerialization)?;
-        ids.insert(key);
-    }
+fn tree_keys<K: Key + Hash + Eq + Clone>(tree: &Tree<StdFile>) -> Result<HashSet<K>, crate::Error> {
+    let mut ids = Vec::new();
+    tree.scan(
+        ..,
+        true,
+        |key| {
+            ids.push(key.clone());
+            KeyEvaluation::Skip
+        },
+        |_, _| Ok(()),
+    )?;
 
-    Ok(ids)
+    Ok(ids
+        .into_iter()
+        .map(|key| K::from_big_endian_bytes(&key).map_err(view::Error::KeySerialization))
+        .collect::<Result<HashSet<_>, view::Error>>()?)
 }
 
 impl<DB> Keyed<Task> for IntegrityScanner<DB>

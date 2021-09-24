@@ -1,0 +1,46 @@
+[package]
+name = "bonsaidb-roots"
+version = "0.1.0"
+edition = "2018"
+description = "ACID-compliant, append-only B-Tree storage inspired by Couchstore."
+repository = "https://github.com/khonsulabs/bonsaidb"
+license = "MIT OR Apache-2.0"
+keywords = ["btree", "database"]
+categories = ["database-implementations"]
+readme = "./README.md"
+homepage = "https://dev.bonsaidb.io/"
+
+[features]
+default = []
+
+[dependencies]
+zerocopy = "0.6"
+thiserror = "1"
+byteorder = "1"
+flume = "0.10"
+crc = "2"
+once_cell = "1"
+lru = "0.6"
+parking_lot = "0.11"
+tracing = { version = "0.1", optional = true }
+ranges = "0.3"
+
+[dev-dependencies]
+nanorand = "0.6"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+pot = { git = "https://github.com/khonsulabs/pot.git", branch = "main" }
+tempfile = "3"
+tabled = "0.3"
+rusqlite = "0.25"
+ureq = { version = "2", features = ["json"] }
+http-auth-basic = "0.3"
+tracing-flame = "0.1"
+tracing-subscriber = "0.2"
+criterion = { version = "0.3", features = ["html_reports"] }
+sled = "0.34"
+
+[[bench]]
+name = "roots-bench"
+harness = false
