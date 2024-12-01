@@ -10,6 +10,7 @@ members = [
     "crates/bonsaidb-server",
     "crates/bonsaidb-keystorage-s3",
     "crates/bonsaidb-utils",
+    "crates/bonsaidb-jobs",
     "examples/*",
     "book/book-examples",
     "xtask",

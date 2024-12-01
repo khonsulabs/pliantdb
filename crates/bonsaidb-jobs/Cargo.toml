@@ -1,0 +1,26 @@
+[package]
+name = "bonsaidb-jobs"
+version = "0.4.0"
+authors = ["Jonathan Johnson <jon@khonsulabs.com>"]
+edition = "2021"
+description = "Persistent job queueing and scheduling for BonsaiDb."
+repository = "https://github.com/khonsulabs/bonsaidb"
+license = "MIT OR Apache-2.0"
+keywords = ["bonsaidb", "job", "queue"]
+categories = ["config"]
+readme = "./README.md"
+homepage = "https://bonsaidb.io/"
+rust-version = "1.58"
+
+[dependencies]
+bonsaidb-core = { version = "0.4.0", path = "../bonsaidb-core" }
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"
+tokio = { version = "=1.16.1", default-features = false, features = ["sync"] }
+flume = "0.10"
+
+[dev-dependencies]
+tokio = { version = "=1.16.1", features = ["full"] }
+bonsaidb-core = { version = "0.4.0", path = "../bonsaidb-core", features = [
+    "test-util",
+] }
